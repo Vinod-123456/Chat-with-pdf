@@ -1,0 +1,127 @@
+import os
+import openai
+import PyPDF2
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+import numpy as np
+
+# Load API key from environment variable
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Initialize the embedding model
+model_name = "sentence-transformers/all-MiniLM-L6-v2"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModel.from_pretrained(model_name)
+
+# Ensure pad_token is set if not already
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token  # Set eos_token as pad_token
+
+# Function to generate sentence embeddings
+def encode_text(text):
+    # Tokenize the input text, set padding=True to automatically pad the sequence
+    inputs = tokenizer(
+        text, 
+        return_tensors="pt", 
+        truncation=True, 
+        padding=True, 
+        return_attention_mask=True
+    )
+    
+    # Get the model output (embedding) and return the mean of the last hidden state
+    outputs = model(**inputs)
+    
+    # Return the embeddings by averaging the last hidden states
+    embeddings = outputs.last_hidden_state.mean(dim=1).detach().numpy()
+    
+    return embeddings.flatten()  # Ensure embedding is a 1D array
+
+# List to store chunks and their metadata
+chunk_store = []
+
+# Function to extract text from a PDF file
+def extract_text_from_pdf(pdf_file):
+    pdf_reader = PyPDF2.PdfReader(pdf_file)
+    text_chunks = []
+    for page in pdf_reader.pages:
+        text = page.extract_text()
+        if text:
+            text_chunks.append(text)
+    return text_chunks
+
+# Function to chunk text into smaller parts
+def chunk_text(text, chunk_size=500):
+    words = text.split()
+    chunks = [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+    return chunks
+
+# Function to create embeddings and store them in the chunk_store
+def create_embeddings_and_store(pdf_chunks, metadata):
+    for chunk in pdf_chunks:
+        embedding = encode_text(chunk)
+        chunk_store.append({"embedding": embedding, "text": chunk, "metadata": metadata})
+
+# Function to retrieve relevant chunks based on a user query
+def retrieve_relevant_chunks(query, top_k=3):
+    query_embedding = encode_text(query)
+    
+    # Calculate cosine similarity
+    similarities = [
+        np.dot(query_embedding, entry["embedding"]) / (
+            np.linalg.norm(query_embedding) * np.linalg.norm(entry["embedding"])
+        ) for entry in chunk_store
+    ]
+    
+    sorted_indices = np.argsort(similarities)[-top_k:][::-1]
+    results = [chunk_store[idx] for idx in sorted_indices]
+    return results
+
+# Function to generate a response using a local Hugging Face model (e.g., GPT-2)
+def generate_response(relevant_chunks, query):
+    model_name = "gpt2"  # Replace with a better model if needed
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+
+    # Prepare the input context and query
+    context = "\n".join([chunk['text'] for chunk in relevant_chunks])
+    prompt = f"Context: {context}\n\nQuery: {query}\n\nAnswer:"
+
+    # Tokenize the prompt
+    inputs = tokenizer.encode(prompt, return_tensors="pt", truncation=True, max_length=1024)
+
+    # Generate the response with adjusted max_new_tokens and higher temperature for diversity
+    outputs = model.generate(
+        inputs, 
+        max_new_tokens=100,  # Limiting new tokens to avoid overly long output
+        num_return_sequences=1, 
+        temperature=1.0,  # Increase randomness
+        top_p=0.95,  # Use nucleus sampling for more variability
+        do_sample=True,  # Enable sampling for randomness
+    )
+    
+    # Decode and return the response
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return response
+
+# Example: Processing a PDF and handling queries
+pdf_path = "/content/yyr report.pdf"  # Replace with your PDF file
+pdf_chunks = []
+
+# Extract text from the PDF and chunk it
+text_data = extract_text_from_pdf(pdf_path)
+for page_text in text_data:
+    pdf_chunks.extend(chunk_text(page_text))
+
+# Store embeddings in the list
+metadata = {"source": pdf_path}
+create_embeddings_and_store(pdf_chunks, metadata)
+
+# Example queries
+query_1 = "What is the internship?"
+relevant_chunks_1 = retrieve_relevant_chunks(query_1)
+response_1 = generate_response(relevant_chunks_1, query_1)
+print("Response 1:", response_1)
+
+query_2 = "What is GUI?"
+relevant_chunks_2 = retrieve_relevant_chunks(query_2)
+response_2 = generate_response(relevant_chunks_2, query_2)
+print("Response 2:", response_2)
